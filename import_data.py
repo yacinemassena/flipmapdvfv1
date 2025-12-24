@@ -3,6 +3,7 @@ import sys
 import os
 import requests
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from database import SessionLocal, engine, Base
 from models import Property
 
@@ -27,6 +28,20 @@ def import_data():
     if not os.path.exists(CSV_FILE):
         print(f"File {CSV_FILE} not found after download.")
         return
+
+    # Check if data already exists
+    with engine.connect() as connection:
+        # Check if table exists first (handled by create_all, but good to be safe)
+        # We can just check count
+        try:
+            result = connection.execute(text("SELECT COUNT(*) FROM properties"))
+            count = result.scalar()
+            if count and count > 0:
+                print(f"Database already contains {count} records. Skipping import.")
+                return
+        except Exception as e:
+            print(f"Error checking database: {e}")
+            # If table doesn't exist, we continue (create_all should have created it though)
 
     print("Reading CSV and importing to DB...")
     
