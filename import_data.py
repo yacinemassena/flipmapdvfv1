@@ -11,7 +11,8 @@ from models import Property
 Base.metadata.create_all(bind=engine)
 
 CSV_URL = os.getenv("CSV_URL", "https://pub-ecf2cacf42304db4aff89b230d889189.r2.dev/source_data.csv")
-CSV_FILE = '/tmp/source_data.csv'
+import tempfile
+CSV_FILE = os.path.join(tempfile.gettempdir(), 'source_data.csv')
 
 def import_data():
     # Download CSV from R2 if not exists locally
@@ -43,7 +44,7 @@ def import_data():
     print("Reading CSV and importing to DB...")
     
     # Read CSV in chunks to handle memory efficiently
-    chunk_size = 10000
+    chunk_size = 1000
     
     for i, chunk in enumerate(pd.read_csv(CSV_FILE, chunksize=chunk_size)):
         print(f"Processing chunk {i+1}...")

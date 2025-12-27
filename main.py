@@ -114,25 +114,18 @@ def get_markers(
         df_grid['lat_idx'] = ((df_grid['latitude'] - min_lat) / lat_step).astype(int)
         df_grid['lon_idx'] = ((df_grid['longitude'] - min_lon) / lon_step).astype(int)
         
-        grouped = df_grid.groupby(['lat_idx', 'lon_idx'])
-        
-        agg_funcs = {
+        grouped = df_grid.groupby(['lat_idx', 'lon_idx'], as_index=False).agg({
             'latitude': 'mean',
             'longitude': 'mean',
-            'id': 'max', # Use max id as representative
+            'id': ['max', 'count'],  # count ET max en 1 passe
             'margin': 'max',
             'type_local': 'max',
             'address': 'max'
-        }
+        })
         
-        # Calculate count separately
-        counts = grouped.size().reset_index(name='count')
-        
-        # Calculate other aggregates
-        agged = grouped.agg(agg_funcs).reset_index()
-        
-        # Merge
-        result = pd.merge(agged, counts, on=['lat_idx', 'lon_idx'])
+        # Flatten multi-index columns
+        grouped.columns = ['lat_idx', 'lon_idx', 'latitude', 'longitude', 'id', 'count', 'margin', 'type_local', 'address']
+        result = grouped
         
         # Convert to list of dicts
         return result.to_dict(orient="records")
