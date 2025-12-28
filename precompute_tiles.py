@@ -7,7 +7,7 @@ import logging
 import polars as pl
 from database import SessionLocal
 from utils import tile_to_bbox, perform_clustering
-from cache import redis_client
+from cache import redis_client_sync
 
 # Configure logging
 logging.basicConfig(
@@ -51,7 +51,7 @@ def precompute_all_tiles(df=None, r_client=None):
     
     # 2. Setup Redis
     if r_client is None:
-        r_client = redis_client
+        r_client = redis_client_sync
 
     pipe = r_client.pipeline()
     total_tiles_generated = 0

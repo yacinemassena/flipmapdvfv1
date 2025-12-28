@@ -2,11 +2,12 @@ import polars as pl
 import math
 import orjson
 import hashlib
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
-from typing import List, Union
 import os
 import time
 import logging
@@ -14,7 +15,7 @@ import threading
 import sys
 from contextlib import asynccontextmanager
 from database import SessionLocal
-from cache import redis_client
+from cache import redis_client_sync, redis_client_async
 from import_data import import_data
 from precompute_tiles import precompute_all_tiles
 from utils import tile_to_bbox, bounds_to_tiles, perform_clustering
@@ -37,8 +38,10 @@ if not logger.hasHandlers():
     logger.addHandler(c_handler)
 
 FRONTEND_DIR = os.path.dirname(os.path.abspath(__file__))
-ALL_PROPERTIES_KEY = "all_properties"
 PROPERTIES_DF = None
+
+# Thread pool for CPU-bound work
+executor = ThreadPoolExecutor(max_workers=8)
 
 # Global Status for Precompute
 PRECOMPUTE_STATUS = {
@@ -92,7 +95,7 @@ def background_precompute():
              load_db_to_memory_sync()
 
         # Pass the dataframe to avoid reloading in the thread if possible
-        precompute_all_tiles(PROPERTIES_DF, redis_client)
+        precompute_all_tiles(PROPERTIES_DF, redis_client_sync)
         
         elapsed = time.time() - start
         print(f"✅ Background pre-computation completed in {elapsed:.2f}s")
@@ -121,10 +124,10 @@ def prewarm_initial_tiles():
         for tx, ty in tiles:
             cache_key = f"tile:{z}:{tx}:{ty}"
             try:
-                if not redis_client.get(cache_key):
+                if not redis_client_sync.get(cache_key):
                     res = compute_tile_on_fly(tx, ty, z)
                     if res:
-                        redis_client.setex(cache_key, 86400, orjson.dumps(res))
+                        redis_client_sync.setex(cache_key, 86400, orjson.dumps(res))
             except Exception as e:
                 logger.error(f"Error prewarming tile {z}/{tx}/{ty}: {e}")
     print("✅ Pre-warming complete.")
@@ -207,22 +210,6 @@ def compute_tile_on_fly(x, y, z):
     
     return perform_clustering(df_filtered, min_lat, max_lat, min_lon, max_lon, z)
 
-def legacy_clustering(min_lat, max_lat, min_lon, max_lon, zoom):
-    """Ancien système de clustering dynamique (fallback)."""
-    df = get_properties_df()
-    if df is None:
-        return []
-
-    # Filter with Polars (parallelized automatically)
-    df_filtered = df.filter(
-        (pl.col('latitude') >= min_lat) & 
-        (pl.col('latitude') <= max_lat) & 
-        (pl.col('longitude') >= min_lon) & 
-        (pl.col('longitude') <= max_lon)
-    )
-
-    return perform_clustering(df_filtered, min_lat, max_lat, min_lon, max_lon, zoom)
-
 def get_cache_key(min_lat, max_lat, min_lon, max_lon, zoom):
     """Generate a cache key for a viewport request."""
     precision = 3 if zoom < 10 else 4
@@ -230,21 +217,25 @@ def get_cache_key(min_lat, max_lat, min_lon, max_lon, zoom):
     return f"viewport:{hashlib.md5(key.encode()).hexdigest()}"
 
 @app.get("/api/markers")
-def get_markers(
+async def get_markers(
     min_lat: float,
     max_lat: float,
     min_lon: float,
     max_lon: float,
     zoom: float,
+    response: Response,
 ):
     """
     Smart endpoint: utilise les tiles pré-calculés si disponibles,
     sinon fallback sur calcul dynamique.
     """
+    # ADD HTTP CACHING
+    response.headers["Cache-Control"] = "public, max-age=60"
+
     # 0. Check Viewport Cache
     viewport_key = get_cache_key(min_lat, max_lat, min_lon, max_lon, zoom)
     try:
-        cached_view = redis_client.get(viewport_key)
+        cached_view = await redis_client_async.get(viewport_key)
         if cached_view:
             return orjson.loads(cached_view)
     except Exception as e:
@@ -254,37 +245,52 @@ def get_markers(
     req_z = min(max(z, 6), 14)  # Clamp between 6-14
     
     tiles_to_fetch = bounds_to_tiles(min_lat, max_lat, min_lon, max_lon, req_z)
-    all_results = []
     
-    for tx, ty in tiles_to_fetch:
-        cache_key = f"tile:{req_z}:{tx}:{ty}"
+    # PARALLEL Redis fetch
+    cache_keys = [f"tile:{req_z}:{tx}:{ty}" for tx, ty in tiles_to_fetch]
+    
+    try:
+        # Use MGET for faster batch retrieval
+        cached_values = await redis_client_async.mget(cache_keys)
+    except Exception as e:
+        logger.error(f"Batch Redis error: {e}")
+        cached_values = [None] * len(cache_keys)
+    
+    all_results = []
+    missing_tiles = []
+    
+    for i, cached in enumerate(cached_values):
+        if cached:
+            all_results.extend(orjson.loads(cached))
+        else:
+            missing_tiles.append((tiles_to_fetch[i], cache_keys[i]))
+    
+    # Compute missing tiles in thread pool (parallel)
+    if missing_tiles:
+        loop = asyncio.get_event_loop()
+        compute_tasks = [
+            loop.run_in_executor(executor, compute_tile_on_fly, tx, ty, req_z)
+            for (tx, ty), _ in missing_tiles
+        ]
         
         try:
-            # 1. Try precomputed/cached tile first
-            cached = redis_client.get(cache_key)
-            if cached:
-                all_results.extend(orjson.loads(cached))
-                continue
+            computed_results = await asyncio.gather(*compute_tasks)
             
-            # 2. Cache miss → compute and CACHE IT
-            tile_result = compute_tile_on_fly(tx, ty, req_z)
-            if tile_result:
-                # Store in Redis for next time
-                redis_client.setex(cache_key, 86400, orjson.dumps(tile_result))
-                all_results.extend(tile_result)
-                
+            for i, tile_result in enumerate(computed_results):
+                if tile_result:
+                    all_results.extend(tile_result)
+                    try:
+                        # Cache the result
+                        await redis_client_async.setex(missing_tiles[i][1], 86400, orjson.dumps(tile_result))
+                    except Exception:
+                        pass
         except Exception as e:
-            logger.error(f"Error fetching tile {req_z}/{tx}/{ty}: {e}")
-    
-    # Only use legacy if we got absolutely nothing (error case)
-    if not all_results and tiles_to_fetch:
-        logger.warning("All tile fetches failed, using legacy fallback")
-        return legacy_clustering(min_lat, max_lat, min_lon, max_lon, zoom)
+            logger.error(f"Error computing missing tiles: {e}")
     
     # Cache the final result for this viewport
     if all_results:
         try:
-             redis_client.setex(viewport_key, 300, orjson.dumps(all_results)) # Cache for 5 mins
+             await redis_client_async.setex(viewport_key, 300, orjson.dumps(all_results)) # Cache for 5 mins
         except Exception as e:
              logger.error(f"Viewport cache write error: {e}")
     
@@ -292,14 +298,14 @@ def get_markers(
 
 
 @app.get("/api/tiles/{z}/{x}/{y}")
-def get_tile(z: int, x: int, y: int, response: Response):
+async def get_tile(z: int, x: int, y: int, response: Response):
     # Set cache headers
     response.headers["Cache-Control"] = "public, max-age=86400"
     
     # Try Redis first
     cache_key = f"tile:{z}:{x}:{y}"
     try:
-        cached = redis_client.get(cache_key)
+        cached = await redis_client_async.get(cache_key)
         if cached:
             logger.debug(f"Cache HIT: {cache_key}")
             return orjson.loads(cached)
@@ -309,12 +315,13 @@ def get_tile(z: int, x: int, y: int, response: Response):
         logger.error(f"Redis error for {cache_key}: {e}")
     
     # Fallback to on-the-fly calculation
-    result = compute_tile_on_fly(x, y, z)
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(executor, compute_tile_on_fly, x, y, z)
         
     # Store in Redis
     try:
         if result:
-            redis_client.setex(cache_key, 86400, orjson.dumps(result))
+            await redis_client_async.setex(cache_key, 86400, orjson.dumps(result))
     except Exception as e:
         logger.error(f"Redis write error: {e}")
         
