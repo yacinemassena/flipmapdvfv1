@@ -10,9 +10,17 @@ class MockRedis:
     
     def setex(self, key, time, value):
         self.cache[key] = value
+        return True
         
     def set(self, key, value):
         self.cache[key] = value
+        return True
+
+    def pipeline(self):
+        return self
+        
+    def execute(self):
+        return True
 
 try:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")

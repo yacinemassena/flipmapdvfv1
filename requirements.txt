@@ -3,6 +3,6 @@ uvicorn
 sqlalchemy
 python-multipart
 psycopg2-binary
-pandas
+polars
 redis
 requests

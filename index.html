@@ -133,6 +133,7 @@
                 
                 console.log("Looking for map: " + mapId);
 
+
                 function initMapLogic(mapInstance) {
                     console.log("Initializing map logic on:", mapInstance);
                     
@@ -142,11 +143,6 @@
                     var typeMap = {'M': 'Maison', 'A': 'Appartement', 'L': 'Local', 'X': 'Autre'};
 
                     function createTooltipContent(props) {
-                        // props matches the structure: [lat, lon, type_code, margin, address]
-                        // OR directly from the API object if we adjust it.
-                        // The original code expected props array from PruneCluster data.obj
-                        // Let's adapt to take the direct property object.
-                        
                         var typeCode = props.type_local ? props.type_local.charAt(0) : 'X';
                         var typeStr = typeMap[typeCode] || 'Autre';
                         var marginVal = props.margin || 0;
@@ -159,72 +155,72 @@
                             '<div class="popup-address">' + address + '</div>';
                     }
 
-                    // Dynamic loading logic
+                    function renderItem(item) {
+                        if (item.latitude === undefined || item.longitude === undefined) return;
+
+                        // Check if it's a cluster
+                        if (item.count !== undefined && item.count > 1) {
+                            // Render as cluster
+                            var sizeClass = 'prunecluster-small';
+                            if (item.count >= 100) sizeClass = 'prunecluster-large';
+                            else if (item.count >= 10) sizeClass = 'prunecluster-medium';
+                            
+                            var icon = L.divIcon({
+                                html: "<div><span>" + item.count + "</span></div>",
+                                className: "prunecluster " + sizeClass,
+                                iconSize: [44, 44] 
+                            });
+                            
+                            var marker = L.marker([item.latitude, item.longitude], { icon: icon });
+                            
+                            // Zoom on click for clusters
+                            marker.on('click', function() {
+                                mapInstance.setView([item.latitude, item.longitude], mapInstance.getZoom() + 2);
+                            });
+                            
+                            markerLayer.addLayer(marker);
+                        } else {
+                            // Render as single property
+                            var marker = L.marker([item.latitude, item.longitude]);
+                            
+                            var tooltipContent = createTooltipContent(item);
+                            
+                            marker.bindTooltip(tooltipContent, {
+                                sticky: true, 
+                                direction: 'top',
+                                className: 'custom-tooltip' 
+                            });
+                            
+                            markerLayer.addLayer(marker);
+                        }
+                    }
+
                     function loadMarkers() {
                         if (!mapInstance) return;
                         
                         const bounds = mapInstance.getBounds();
-                        const zoom = mapInstance.getZoom();
+                        const zoom = Math.floor(mapInstance.getZoom());
                         
-                        console.log("Loading markers for bounds:", bounds.toBBoxString(), "Zoom:", zoom);
-
-                        fetch(`/api/markers?` + new URLSearchParams({
-                            min_lat: bounds.getSouth(),
-                            max_lat: bounds.getNorth(),
-                            min_lon: bounds.getWest(),
-                            max_lon: bounds.getEast(),
-                            zoom: zoom
-                        }))
-                        .then(r => r.json())
-                        .then(data => {
-                            console.log(`Fetched ${data.length} markers/items.`);
-                            markerLayer.clearLayers();
-                            
-                            data.forEach(item => {
-                                if (item.latitude === undefined || item.longitude === undefined) return;
-
-                                // Check if it's a cluster
-                                if (item.count !== undefined && item.count > 1) {
-                                    // Render as cluster
-                                    var sizeClass = 'prunecluster-small';
-                                    if (item.count >= 100) sizeClass = 'prunecluster-large';
-                                    else if (item.count >= 10) sizeClass = 'prunecluster-medium';
-                                    
-                                    var icon = L.divIcon({
-                                        html: "<div><span>" + item.count + "</span></div>",
-                                        className: "prunecluster " + sizeClass,
-                                        iconSize: [44, 44] // Approximate size for PruneCluster icons
-                                    });
-                                    
-                                    var marker = L.marker([item.latitude, item.longitude], { icon: icon });
-                                    
-                                    // Zoom on click for clusters
-                                    marker.on('click', function() {
-                                        mapInstance.setView([item.latitude, item.longitude], zoom + 2);
-                                    });
-                                    
-                                    markerLayer.addLayer(marker);
-                                } else {
-                                    // Render as single property
-                                    var marker = L.marker([item.latitude, item.longitude]);
-                                    
-                                    var tooltipContent = createTooltipContent(item);
-                                    
-                                    marker.bindTooltip(tooltipContent, {
-                                        sticky: true, 
-                                        direction: 'top',
-                                        className: 'custom-tooltip' 
-                                    });
-                                    
-                                    markerLayer.addLayer(marker);
-                                }
-                            });
-                        })
-                        .catch(err => console.error("Error loading markers:", err));
+                        const minLat = bounds.getSouth();
+                        const maxLat = bounds.getNorth();
+                        const minLon = bounds.getWest();
+                        const maxLon = bounds.getEast();
+                        
+                        const url = `/api/markers?min_lat=${minLat}&max_lat=${maxLat}&min_lon=${minLon}&max_lon=${maxLon}&zoom=${zoom}`;
+                        
+                        console.log("Loading markers from smart endpoint:", url);
+                        
+                        fetch(url)
+                            .then(r => r.json())
+                            .then(data => {
+                                console.log(`Received ${data.length} markers`);
+                                markerLayer.clearLayers();
+                                data.forEach(item => renderItem(item));
+                            })
+                            .catch(err => console.error("Error loading markers:", err));
                     }
 
                     mapInstance.on('moveend', loadMarkers);
-                    mapInstance.on('zoomend', loadMarkers);
                     
                     // Initial load
                     loadMarkers();
