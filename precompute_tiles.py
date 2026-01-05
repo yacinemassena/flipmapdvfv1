@@ -1,46 +1,59 @@
+# precompute_tiles.py
+import asyncio
 import logging
+import time
 import orjson
-from concurrent.futures import ThreadPoolExecutor
-from cache import redis_sync
-from utils import cluster_by_h3, MIN_RES, MAX_RES
+from cache import redis_client
+from utils import cluster_by_h3, assign_h3
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("precompute")
-executor = ThreadPoolExecutor(max_workers=8)
 
-LOCK_KEY = "h3:precompute:lock"
+# Example zoom-to-H3 resolution mapping
+ZOOM_TO_H3 = {6: 5, 7: 6, 8: 6, 9: 7, 10: 7, 11: 8, 12: 8, 13: 9, 14: 9}
 
 
-def precompute_all(df):
-    lock = redis_sync.lock(LOCK_KEY, timeout=3600, blocking=False)
-
-    if not lock.acquire(blocking=False):
-        logger.info("Another worker is precomputing. Skipping.")
+async def precompute(df):
+    """
+    Precompute clusters for all zoom levels and store in Redis using a pipeline.
+    """
+    if df is None or df.is_empty():
+        logger.warning("No data to precompute!")
         return
 
-    try:
-        logger.info("Precompute lock acquired")
-        futures = []
+    start_time = time.time()
+    pipe = redis_client.pipeline()
 
-        for res in range(MIN_RES, MAX_RES + 1):
-            futures.append(executor.submit(_compute_resolution, df, res))
+    total_tiles = 0
 
-        for f in futures:
-            f.result()
+    for zoom in range(6, 15):
+        h3_res = ZOOM_TO_H3[zoom]
+        clusters = cluster_by_h3(df, h3_res)
 
-        redis_sync.set("h3:precompute:done", b"1")
-        logger.info("Precompute completed")
+        # Skip empty clusters
+        if not clusters:
+            continue
 
-    finally:
-        lock.release()
+        # Compute Redis key per zoom (storing all clusters per zoom)
+        key = f"zoom:{zoom}:all"
+
+        # Use pipeline to store in Redis
+        pipe.set(key, orjson.dumps(clusters))
+        total_tiles += 1
+
+        # Optional: flush every N zooms or N tiles
+        if total_tiles % 5 == 0:
+            await pipe.execute()
+
+        logger.info(f"Zoom {zoom}: {len(clusters)} clusters queued for Redis.")
+
+    # Final flush
+    await pipe.execute()
+    elapsed = time.time() - start_time
+    logger.info(
+        f"Precompute complete. Total zooms: {total_tiles}. Time: {elapsed:.2f}s"
+    )
 
 
-def _compute_resolution(df, res: int):
-    clusters = cluster_by_h3(df, res)
-
-    pipe = redis_sync.pipeline(transaction=False)
-    for item in clusters:
-        key = f"h3:{res}:{item['h3']}"
-        pipe.set(key, orjson.dumps(item))
-    pipe.execute()
-
-    logger.info(f"Resolution {res}: {len(clusters)} cells stored")
+def get_zoom_resolution(zoom: int) -> int:
+    return ZOOM_TO_H3.get(int(zoom), 9)
