@@ -1,9 +1,10 @@
 fastapi
-uvicorn
-sqlalchemy
-python-multipart
-psycopg2-binary
+uvicorn[standard]
 polars
-redis
-requests
 orjson
+redis
+redis[asyncio]
+h3
+aiofiles
+python-multipart
+requests
