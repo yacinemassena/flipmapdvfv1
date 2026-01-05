@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 
+from fastapi.responses import FileResponse
 import orjson
 from import_data import import_data
 from cache import redis_client
@@ -77,6 +78,12 @@ def get_viewport_cache_key(min_lat, max_lat, min_lon, max_lon, zoom) -> str:
     import hashlib
 
     return "viewport:" + hashlib.md5(key_str.encode()).hexdigest()
+FRONTEND_DIR = "."
+
+
+@app.get("/")
+async def root():
+    return FileResponse(f"{FRONTEND_DIR}/index.html")
 
 
 @app.get("/api/markers")
